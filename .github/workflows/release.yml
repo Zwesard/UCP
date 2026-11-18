@@ -1,0 +1,40 @@
+# При создании тега вида v1.0.0 собирает portable-exe на Windows
+# и прикладывает его к релизу на GitHub. Можно запустить и вручную (Actions → Run workflow).
+name: Build & Release
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Tests
+        run: python tests/test_logic.py
+      - name: Build portable exe
+        run: |
+          pip install pyinstaller
+          pyinstaller --onefile --noconsole --clean --name UpdateChecker-Portable update_checker.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: UpdateChecker-Portable
+          path: dist/UpdateChecker-Portable.exe
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/UpdateChecker-Portable.exe
+          generate_release_notes: true
+          body: |
+            ## Update Checker — portable для Windows 11
+            Скачайте **UpdateChecker-Portable.exe** и запустите двойным кликом. Установка, Python и другие программы **не нужны**.
+            Настройки хранятся в `settings.json` рядом с exe.
+            > Windows SmartScreen может показать предупреждение (exe не подписан): «Подробнее» → «Выполнить в любом случае».
