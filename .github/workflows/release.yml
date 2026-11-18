@@ -22,7 +22,7 @@ jobs:
       - name: Build portable exe
         run: |
           pip install pyinstaller
-          pyinstaller --onefile --noconsole --clean --name UpdateChecker-Portable update_checker.py
+          pyinstaller --onefile --noconsole --uac-admin --clean --name UpdateChecker-Portable update_checker.py
       - uses: actions/upload-artifact@v4
         with:
           name: UpdateChecker-Portable
@@ -33,8 +33,4 @@ jobs:
         with:
           files: dist/UpdateChecker-Portable.exe
           generate_release_notes: true
-          body: |
-            ## Update Checker — portable для Windows 11
-            Скачайте **UpdateChecker-Portable.exe** и запустите двойным кликом. Установка, Python и другие программы **не нужны**.
-            Настройки хранятся в `settings.json` рядом с exe.
-            > Windows SmartScreen может показать предупреждение (exe не подписан): «Подробнее» → «Выполнить в любом случае».
+          body_path: release_notes.md

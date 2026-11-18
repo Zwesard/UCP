@@ -1,5 +1,5 @@
 """
-Update Checker — проверка и установка обновлений программ в Windows 11 (аналог SUMo).
+Update Checker — проверка и установка обновлений программ в Windows 11.
 
 Источники: winget, Microsoft Store, Chocolatey, Scoop.
 Портативный режим: все данные лежат в settings.json рядом с программой.
@@ -24,17 +24,20 @@ try:
 except ImportError:  # запуск не на Windows (только для разработки)
     winreg = None
 
-VERSION = "1.0.0"
+VERSION = "1.2.0"
 APP_NAME = "Update Checker"
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+DEVNULL = subprocess.DEVNULL
 WG_FLAGS = ["--accept-source-agreements", "--disable-interactivity"]
-WG_PKG = ["--accept-package-agreements", "--accept-source-agreements", "--silent"]
+WG_PKG = ["--accept-package-agreements", "--accept-source-agreements",
+          "--disable-interactivity", "--silent"]
 
 SOURCE_LABEL = {"winget": "winget", "msstore": "Microsoft Store", "choco": "Chocolatey",
                 "scoop": "Scoop", "": "—"}
 STATUS_LABEL = {"update": "⬆ Доступно обновление", "ok": "✔ Актуальна",
                 "unknown": "· Нет в базах", "pinned": "📌 Закреплена"}
 STATUS_ORDER = {"update": 0, "pinned": 1, "ok": 2, "unknown": 3}
+WINGET_HINTS = {0x8A15002B: "обновление не применимо (программа уже актуальна или требуется другой источник)"}
 
 UNINSTALL_KEYS = [
     (r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall", "HKLM", 0x0100),
@@ -44,26 +47,28 @@ UNINSTALL_KEYS = [
 
 HELP_TEXT = """КАК ПОЛЬЗОВАТЬСЯ
 
-1. «Проверить» — программа читает список установленного ПО и спрашивает
-   winget, Microsoft Store, Chocolatey и Scoop о новых версиях.
-2. Поставьте галочки ☑ слева от программ (или кликните по ☑ в заголовке —
-   отметятся все с обновлениями) и нажмите «Обновить отмеченные».
+1. Проверка запускается сама при старте (и по кнопке «Проверить» / F5).
+   Программы с доступными обновлениями всегда стоят в начале списка.
+2. Поставьте галочки ☑ слева от программ (клик по ☑ в заголовке отмечает
+   все обновления) и нажмите «Обновить отмеченные».
+   Успешно обновлённая программа сразу исчезает из списка обновлений.
 3. Если программа запущена, вас спросят, можно ли её закрыть. Сначала
-   отправляется обычная команда закрытия окна, и лишь потом — принудительная.
+   отправляется обычная команда закрытия окна, затем — принудительная.
+4. Если установка «зависла» (например, на «Starting package install…»),
+   нажмите «⏹ Остановить». Через 90 секунд без вывода программа сама
+   предупредит об этом в журнале.
 
-📌 ЗАКРЕПИТЬ ВЕРСИЮ
-   Закреплённая программа не обновляется ни кнопкой «Обновить все», ни
-   отметкой. Нужна, когда новая версия вас не устраивает.
+📌 ЗАКРЕПИТЬ ВЕРСИЮ — программа не обновляется ни кнопкой «Обновить все»,
+   ни отметкой.
 
-↩ ОТКАТ
-   Установит выбранную старую версию поверх текущей. Работает для winget,
-   Chocolatey и Scoop (Microsoft Store не поддерживает откат). После отката
-   можно закрепить версию, чтобы она не обновилась снова. Вкладка «История»
-   показывает все обновления — выберите запись и нажмите «Откатить».
+↩ ОТКАТ — установит выбранную старую версию (winget, Chocolatey, Scoop;
+   Microsoft Store откат не поддерживает). Вкладка «История и откат»
+   показывает все обновления: выберите запись и нажмите «Откатить».
 
-ПРАВА АДМИНИСТРАТОРА
-   Нужны для Chocolatey и части программ в Program Files.
-   Кнопка «🛡 От администратора» перезапустит программу с нужными правами.
+ЖУРНАЛ — потяните за разделитель над журналом, чтобы изменить его высоту.
+
+ПРАВА АДМИНИСТРАТОРА — программа запрашивает их при запуске: они нужны
+   установщикам, чтобы обновления не зависали на запросе UAC.
 """
 
 
@@ -76,7 +81,7 @@ def app_dir():
 
 SETTINGS_PATH = os.path.join(app_dir(), "settings.json")
 DEFAULTS = {
-    "geometry": "1180x720", "scan_on_start": True, "close_mode": "ask",
+    "geometry": "1180x760", "close_mode": "ask",
     "sources": {"winget": True, "msstore": True, "choco": True, "scoop": True},
     "pins": {}, "history": [], "cache": [], "cache_time": "",
 }
@@ -116,11 +121,15 @@ def is_admin():
 
 
 def relaunch_as_admin():
-    if getattr(sys, "frozen", False):
-        exe, params = sys.executable, ""
-    else:
-        exe, params = sys.executable, f'"{os.path.abspath(__file__)}"'
-    ctypes.windll.shell32.ShellExecuteW(None, "runas", exe, params, None, 1)
+    """Перезапуск с запросом UAC. True — запрос принят (текущий процесс нужно закрыть)."""
+    try:
+        if getattr(sys, "frozen", False):
+            exe, params = sys.executable, ""
+        else:
+            exe, params = sys.executable, f'"{os.path.abspath(__file__)}"'
+        return ctypes.windll.shell32.ShellExecuteW(None, "runas", exe, params, None, 1) > 32
+    except Exception:
+        return False
 
 
 # ------------------------------------------------------------------ утилиты ---
@@ -132,13 +141,26 @@ def key_of(item):
     return norm(item["name"])
 
 
-def run_text(cmd, timeout=240):
+def has_digit(s):
+    return bool(re.search(r"\d", s or ""))
+
+
+ERRS = []   # ошибки запуска внешних команд (для диагностики в журнале)
+RAW = {}    # последний «сырой» вывод команд
+
+
+def run_text(cmd, timeout=240, tag=None):
+    """Запуск команды с захватом вывода. stdin отключён: иначе в оконном exe процессы виснут/падают."""
     try:
-        return subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
-                              errors="replace", creationflags=NO_WINDOW,
-                              timeout=timeout).stdout or ""
-    except (OSError, subprocess.SubprocessError):
-        return ""
+        out = subprocess.run(cmd, stdin=DEVNULL, capture_output=True, text=True, encoding="utf-8",
+                             errors="replace", creationflags=NO_WINDOW, timeout=timeout).stdout or ""
+    except (OSError, subprocess.SubprocessError) as e:
+        ERRS.append(f"{os.path.basename(str(cmd[0]))}: {e}")
+        out = ""
+    out = re.sub(r"\x1b\[[0-9;?]*[ -/]*[@-~]", "", out).lstrip("\ufeff")
+    if tag:
+        RAW[tag] = out
+    return out
 
 
 def ps_cmd(command):
@@ -146,20 +168,59 @@ def ps_cmd(command):
             "[Console]::OutputEncoding=[Text.Encoding]::UTF8; " + command]
 
 
-def have_scoop():
-    return bool(shutil.which("scoop")) or os.path.isdir(os.path.expanduser("~/scoop"))
+# --- поиск установленных менеджеров пакетов (в т.ч. когда их нет в PATH) ---
+def find_winget():
+    return shutil.which("winget")
 
 
-def have_choco():
-    return bool(shutil.which("choco"))
+def find_choco():
+    p = shutil.which("choco")
+    if p:
+        return p
+    root = os.environ.get("ChocolateyInstall") or os.path.join(
+        os.environ.get("ProgramData", r"C:\ProgramData"), "chocolatey")
+    c = os.path.join(root, "bin", "choco.exe")
+    return c if os.path.isfile(c) else None
+
+
+def find_scoop():
+    for root in (os.environ.get("SCOOP"), os.path.join(os.path.expanduser("~"), "scoop")):
+        if root:
+            for n in ("scoop.cmd", "scoop.ps1"):
+                p = os.path.join(root, "shims", n)
+                if os.path.isfile(p):
+                    return p
+    return shutil.which("scoop")
 
 
 def have_winget():
-    return bool(shutil.which("winget"))
+    return bool(find_winget())
 
 
-def parse_table(text):
-    """Универсальный разбор таблиц winget/scoop по позициям колонок (любая локаль)."""
+def have_choco():
+    return bool(find_choco())
+
+
+def have_scoop():
+    return bool(find_scoop())
+
+
+def choco_cmd(*args):
+    return [find_choco() or "choco", *args]
+
+
+def scoop_prefix():
+    p = find_scoop() or "scoop"
+    return "scoop" if p == "scoop" else f"& '{p}'"
+
+
+def scoop_ps(args):
+    return ps_cmd(f"{scoop_prefix()} {args}")
+
+
+def table_rows(text, valid):
+    """Разбор таблиц winget/scoop. Для каждой строки пробуем два способа:
+    нарезка по позициям колонок и разделение по 2+ пробелам (устойчиво к широким символам)."""
     rows, starts = [], None
     lines = [l.rstrip("\r") for l in text.splitlines()]
     for i, line in enumerate(lines):
@@ -172,12 +233,13 @@ def parse_table(text):
             continue
         if not starts or not s:
             continue
-        rows.append([line[a:b].strip() for a, b in zip(starts, starts[1:] + [None])])
+        pos = [line[a:b].strip() for a, b in zip(starts, starts[1:] + [None])]
+        gap = re.split(r"\s{2,}", s)
+        for cols in (pos, gap):
+            if valid(cols):
+                rows.append(cols)
+                break
     return rows
-
-
-def has_digit(s):
-    return bool(re.search(r"\d", s or ""))
 
 
 # -------------------------------------------------------- чтение инвентаря ---
@@ -220,33 +282,28 @@ def read_installed():
 
 
 def winget_installed():
-    rows = []
-    for c in parse_table(run_text(["winget", "list"] + WG_FLAGS)):
-        if len(c) < 4:
-            continue
-        name, pid, ver, src = c[0], c[1], c[2], c[-1].lower()
-        if pid and " " not in pid and src in ("winget", "msstore"):
-            rows.append({"name": name, "id": pid, "version": ver.lstrip("<> "), "source": src})
-    return rows
+    out = run_text(["winget", "list"] + WG_FLAGS, tag="winget list")
+    valid = lambda c: (len(c) >= 4 and c[1] and " " not in c[1] and has_digit(c[2])
+                       and c[-1].lower() in ("winget", "msstore"))
+    return [{"name": c[0], "id": c[1], "version": c[2].lstrip("<> "), "source": c[-1].lower()}
+            for c in table_rows(out, valid)]
 
 
 def winget_outdated():
+    out = run_text(["winget", "upgrade"] + WG_FLAGS, tag="winget upgrade")
+    valid = lambda c: len(c) >= 4 and c[1] and " " not in c[1] and c[2] and has_digit(c[3])
     rows = []
-    for c in parse_table(run_text(["winget", "upgrade"] + WG_FLAGS)):
-        if len(c) < 4:
-            continue
-        name, pid, cur, avail = c[:4]
+    for c in table_rows(out, valid):
         src = c[4].lower() if len(c) > 4 and c[4] else "winget"
-        if pid and " " not in pid and cur and has_digit(avail):
-            rows.append({"name": name, "id": pid, "version": cur.lstrip("<> "),
-                         "available": avail.lstrip("<> "),
-                         "source": "msstore" if src.startswith("msstore") else "winget"})
+        rows.append({"name": c[0], "id": c[1], "version": c[2].lstrip("<> "),
+                     "available": c[3].lstrip("<> "),
+                     "source": "msstore" if src.startswith("msstore") else "winget"})
     return rows
 
 
 def choco_installed():
     out = []
-    for line in run_text(["choco", "list", "--local-only", "-r", "--no-color"]).splitlines():
+    for line in run_text(choco_cmd("list", "--local-only", "-r", "--no-color"), tag="choco list").splitlines():
         p = line.strip().split("|")
         if len(p) == 2 and has_digit(p[1]):
             out.append({"name": p[0], "id": p[0], "version": p[1], "source": "choco"})
@@ -255,7 +312,7 @@ def choco_installed():
 
 def choco_outdated():
     out = []
-    for line in run_text(["choco", "outdated", "-r", "--no-color"]).splitlines():
+    for line in run_text(choco_cmd("outdated", "-r", "--no-color"), tag="choco outdated").splitlines():
         p = line.strip().split("|")
         if len(p) >= 3 and has_digit(p[1]) and has_digit(p[2]):
             out.append({"name": p[0], "id": p[0], "version": p[1], "available": p[2],
@@ -264,20 +321,15 @@ def choco_outdated():
 
 
 def scoop_installed():
-    out = []
-    for c in parse_table(run_text(ps_cmd("scoop list"))):
-        if len(c) >= 2 and c[0] and " " not in c[0] and has_digit(c[1]):
-            out.append({"name": c[0], "id": c[0], "version": c[1], "source": "scoop"})
-    return out
+    valid = lambda c: len(c) >= 2 and c[0] and " " not in c[0] and has_digit(c[1])
+    return [{"name": c[0], "id": c[0], "version": c[1], "source": "scoop"}
+            for c in table_rows(run_text(scoop_ps("list"), tag="scoop list"), valid)]
 
 
 def scoop_outdated():
-    out = []
-    for c in parse_table(run_text(ps_cmd("scoop status"))):
-        if len(c) >= 3 and c[0] and " " not in c[0] and has_digit(c[1]) and has_digit(c[2]):
-            out.append({"name": c[0], "id": c[0], "version": c[1], "available": c[2],
-                        "source": "scoop"})
-    return out
+    valid = lambda c: len(c) >= 3 and c[0] and " " not in c[0] and has_digit(c[1]) and has_digit(c[2])
+    return [{"name": c[0], "id": c[0], "version": c[1], "available": c[2], "source": "scoop"}
+            for c in table_rows(run_text(scoop_ps("status"), tag="scoop status"), valid)]
 
 
 def match(nm, table):
@@ -291,28 +343,46 @@ def match(nm, table):
     return None
 
 
-def scan(sources):
+def head(tag):
+    raw = [l.strip() for l in (RAW.get(tag) or "").splitlines() if l.strip()]
+    return " | ".join(raw[:4])[:300] or "(пусто)"
+
+
+def scan(sources, log=lambda t: None):
     """Возвращает список программ (dict) с источником, id и статусом."""
+    ERRS.clear()
+    RAW.clear()
     reg = read_installed()
+    log(f"   Реестр Windows: программ найдено — {len(reg)}")
+    use_w = bool(sources.get("winget") or sources.get("msstore")) and have_winget()
+    use_c = bool(sources.get("choco")) and have_choco()
+    use_s = bool(sources.get("scoop")) and have_scoop()
     tasks = {}
     with ThreadPoolExecutor(max_workers=6) as ex:
-        if sources.get("winget") or sources.get("msstore"):
-            if have_winget():
-                tasks["w_inv"] = ex.submit(winget_installed)
-                tasks["w_up"] = ex.submit(winget_outdated)
-        if sources.get("choco") and have_choco():
-            tasks["c_inv"] = ex.submit(choco_installed)
-            tasks["c_up"] = ex.submit(choco_outdated)
-        if sources.get("scoop") and have_scoop():
-            tasks["s_inv"] = ex.submit(scoop_installed)
-            tasks["s_up"] = ex.submit(scoop_outdated)
+        if use_w:
+            tasks["w_inv"], tasks["w_up"] = ex.submit(winget_installed), ex.submit(winget_outdated)
+        if use_c:
+            tasks["c_inv"], tasks["c_up"] = ex.submit(choco_installed), ex.submit(choco_outdated)
+        if use_s:
+            tasks["s_inv"], tasks["s_up"] = ex.submit(scoop_installed), ex.submit(scoop_outdated)
         res = {k: f.result() for k, f in tasks.items()}
 
-    def want(rows):
-        return [r for r in rows if sources.get(r["source"], True)]
+    for e in ERRS:
+        log(f"   ⚠ {e}")
+    if use_w:
+        n_i, n_u = len(res["w_inv"]), len(res["w_up"])
+        log(f"   winget: известных программ {n_i}, обновлений {n_u}")
+        if not n_i and not n_u:
+            log("   ⚠ winget не вернул таблицу. Начало вывода: " + head("winget list"))
+    elif sources.get("winget") or sources.get("msstore"):
+        log("   ⚠ winget не найден (установите «Установщик приложений» из Microsoft Store)")
+    if use_c:
+        log(f"   Chocolatey: пакетов {len(res['c_inv'])}, обновлений {len(res['c_up'])}")
+    if use_s:
+        log(f"   Scoop: пакетов {len(res['s_inv'])}, обновлений {len(res['s_up'])}")
 
     def tab(rows):
-        return {norm(r["name"]): r for r in want(rows)}
+        return {norm(r["name"]): r for r in rows if sources.get(r["source"], True)}
 
     inv = {"winget": tab(res.get("w_inv", [])), "choco": tab(res.get("c_inv", [])),
            "scoop": tab(res.get("s_inv", []))}
@@ -361,9 +431,9 @@ def upgrade_cmd(it):
         cmd = ["winget", "upgrade", "--id", i, "--exact"] + WG_PKG
         return cmd + (["--source", "msstore"] if s == "msstore" else [])
     if s == "choco":
-        return ["choco", "upgrade", i, "-y", "--no-progress"]
+        return choco_cmd("upgrade", i, "-y", "--no-progress")
     if s == "scoop":
-        return ps_cmd(f"scoop update {i}")
+        return scoop_ps(f"update {i}")
     return None
 
 
@@ -372,10 +442,10 @@ def rollback_cmd(it, ver):
     if s == "winget":
         return ["winget", "install", "--id", i, "--exact", "--version", ver, "--force"] + WG_PKG
     if s == "choco":
-        return ["choco", "install", i, "--version", ver, "-y", "--force",
-                "--allow-downgrade", "--no-progress"]
+        return choco_cmd("install", i, "--version", ver, "-y", "--force", "--allow-downgrade", "--no-progress")
     if s == "scoop":
-        return ps_cmd(f"scoop uninstall {i}; scoop install {i}@{ver}")
+        p = scoop_prefix()
+        return ps_cmd(f"{p} uninstall {i}; {p} install {i}@{ver}")
     return None  # msstore и неизвестные — откат невозможен
 
 
@@ -391,11 +461,69 @@ def list_versions(it):
             elif seen_sep and line.strip() and has_digit(line):
                 vers.append(line.strip())
     elif s == "choco":
-        for line in run_text(["choco", "list", i, "--exact", "--all-versions", "-r"]).splitlines():
+        for line in run_text(choco_cmd("list", i, "--exact", "--all-versions", "-r")).splitlines():
             p = line.strip().split("|")
             if len(p) == 2 and has_digit(p[1]):
                 vers.append(p[1])
     return vers
+
+
+def kill_tree(pid):
+    try:
+        subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], stdin=DEVNULL,
+                       capture_output=True, creationflags=NO_WINDOW)
+    except OSError:
+        pass
+
+
+def stream_cmd(cmd, log, cancel, idle_warn=90, hard_timeout=3600):
+    """Запуск с потоковым выводом в журнал. Возвращает код возврата или None (прервано).
+    Умеет отмену, предупреждение о «зависании» и жёсткий таймаут."""
+    p = subprocess.Popen(cmd, stdin=DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                         text=True, encoding="utf-8", errors="replace", creationflags=NO_WINDOW)
+    q = queue.Queue()
+
+    def reader():
+        for line in p.stdout:
+            q.put(line)
+        q.put(None)
+    threading.Thread(target=reader, daemon=True).start()
+
+    start = last = time.time()
+    warned, prev = False, ""
+    while True:
+        if cancel.is_set():
+            kill_tree(p.pid)
+            p.kill()
+            log("   ⏹ остановлено пользователем")
+            return None
+        try:
+            line = q.get(timeout=1)
+        except queue.Empty:
+            now = time.time()
+            if p.poll() is not None and now - last > 3:
+                break  # процесс завершился, но «хвосты» удерживают канал
+            if not warned and now - last > idle_warn:
+                warned = True
+                log(f"   ⏳ Нет вывода уже {int(now - last)} сек. Установщик, возможно, ждёт закрытия "
+                    "программы или показывает окно. Если завис — нажмите «⏹ Остановить».")
+            if now - start > hard_timeout:
+                kill_tree(p.pid)
+                p.kill()
+                log("   ⏱ превышено время ожидания, установка прервана")
+                return None
+            continue
+        if line is None:
+            break
+        last, warned = time.time(), False
+        for part in re.split(r"[\r\n]+", line):
+            part = part.strip()
+            if not part or "█" in part or "▒" in part or re.fullmatch(r"[-\\|/]", part) or part == prev:
+                continue
+            prev = part
+            log("   " + part)
+    p.wait()
+    return p.returncode & 0xFFFFFFFF
 
 
 # ----------------------------------------------------------------- процессы ---
@@ -441,15 +569,15 @@ def pid_alive(pid):
 
 def close_processes(pids, log):
     for pid in pids:
-        subprocess.run(["taskkill", "/PID", str(pid)], capture_output=True, creationflags=NO_WINDOW)
+        subprocess.run(["taskkill", "/PID", str(pid)], stdin=DEVNULL, capture_output=True,
+                       creationflags=NO_WINDOW)
     deadline = time.time() + 8
     while time.time() < deadline and any(pid_alive(p) for p in pids):
         time.sleep(0.5)
     for pid in pids:
         if pid_alive(pid):
             log(f"   принудительное закрытие PID {pid}")
-            subprocess.run(["taskkill", "/PID", str(pid), "/F", "/T"], capture_output=True,
-                           creationflags=NO_WINDOW)
+            kill_tree(pid)
 
 
 # --------------------------------------------------------- диалог отката ---
@@ -514,25 +642,25 @@ class App(tk.Tk):
         self.checked = set()
         self.q = queue.Queue()
         self.busy = False
+        self.running_jobs = False
+        self.cancel = threading.Event()
         self.sort_col, self.sort_desc = None, False
         self.title(f"{APP_NAME} {VERSION}" + ("  —  Администратор" if is_admin() else ""))
         self.geometry(self.cfg["geometry"])
-        self.minsize(960, 560)
+        self.minsize(960, 600)
         self.build_ui()
         self.bind_keys()
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         self.refresh_table()
         self.refresh_history()
         if self.items:
-            self.status.set(f"Показан результат прошлой проверки ({self.cfg['cache_time']}). "
-                            "Нажмите «Проверить» для обновления.")
-        else:
-            self.status.set("Нажмите «Проверить», чтобы найти обновления.")
+            self.status.set(f"Показан результат прошлой проверки ({self.cfg['cache_time']}). Идёт новая проверка…")
         if winreg is None:
             messagebox.showwarning("Только Windows", "Программа работает только в Windows.")
-        elif self.cfg["scan_on_start"]:
-            self.after(300, self.start_scan)
+        else:
+            self.after(300, self.start_scan)   # проверка при каждом запуске
         self.after(100, self.poll)
+        self.after(250, self.init_sash)
 
     # ------------------------------------------------------------ интерфейс
     def build_ui(self):
@@ -545,7 +673,6 @@ class App(tk.Tk):
         style.configure("CardCap.TLabel", foreground="#666")
         style.configure("Treeview", rowheight=26)
 
-        # карточки-счётчики
         cards = ttk.Frame(self, padding=(10, 8, 10, 0))
         cards.pack(fill="x")
         self.cnt = {}
@@ -557,7 +684,6 @@ class App(tk.Tk):
             ttk.Label(box, text=cap, style="CardCap.TLabel").pack(anchor="w")
         self.cnt["update"].configure(foreground="#b45f06")
 
-        # панель кнопок
         bar = ttk.Frame(self, padding=(10, 8))
         bar.pack(fill="x")
         self.btn_scan = ttk.Button(bar, text="🔍 Проверить", command=self.start_scan)
@@ -565,7 +691,8 @@ class App(tk.Tk):
         self.btn_all = ttk.Button(bar, text="⬆⬆ Обновить все", command=self.update_all)
         self.btn_pin = ttk.Button(bar, text="📌 Закрепить версию", command=self.toggle_pin)
         self.btn_rb = ttk.Button(bar, text="↩ Откат…", command=self.rollback_selected)
-        for b in (self.btn_scan, self.btn_upd, self.btn_all, self.btn_pin, self.btn_rb):
+        self.btn_stop = ttk.Button(bar, text="⏹ Остановить", command=self.stop_jobs, state="disabled")
+        for b in (self.btn_scan, self.btn_upd, self.btn_all, self.btn_pin, self.btn_rb, self.btn_stop):
             b.pack(side="left", padx=(0, 6))
         mb = ttk.Menubutton(bar, text="⚙ Настройки")
         self.build_menu(mb)
@@ -573,13 +700,24 @@ class App(tk.Tk):
         if not is_admin() and winreg:
             ttk.Button(bar, text="🛡 От администратора", command=self.admin).pack(side="right", padx=6)
 
-        self.nb = ttk.Notebook(self)
-        self.nb.pack(fill="both", expand=True, padx=10)
+        # строка состояния и прогресс — снизу (упаковываем до растягиваемой части)
+        self.status = tk.StringVar()
+        ttk.Label(self, textvariable=self.status, anchor="w", padding=(10, 6)).pack(side="bottom", fill="x")
+        self.progress = ttk.Progressbar(self, mode="determinate")
+        self.progress.pack(side="bottom", fill="x", padx=10, pady=(6, 0))
+
+        # растягиваемая область: вкладки сверху, журнал снизу (граница перетаскивается)
+        self.pw = ttk.PanedWindow(self, orient="vertical")
+        self.pw.pack(fill="both", expand=True, padx=10)
+        self.nb = ttk.Notebook(self.pw)
+        self.pw.add(self.nb, weight=4)
+        logf = ttk.Frame(self.pw)
+        self.pw.add(logf, weight=1)
+
         tab1, tab2 = ttk.Frame(self.nb), ttk.Frame(self.nb)
         self.nb.add(tab1, text="  Программы  ")
         self.nb.add(tab2, text="  История и откат  ")
 
-        # --- вкладка «Программы»
         flt = ttk.Frame(tab1, padding=(0, 8))
         flt.pack(fill="x")
         ttk.Label(flt, text="Поиск:").pack(side="left")
@@ -589,9 +727,8 @@ class App(tk.Tk):
         self.search_entry.pack(side="left", padx=(4, 14))
         ttk.Label(flt, text="Показывать:").pack(side="left")
         self.view = tk.StringVar(value="Все")
-        c1 = ttk.Combobox(flt, textvariable=self.view, state="readonly", width=18,
-                          values=["Все", "Только с обновлениями", "Актуальные",
-                                  "Закреплённые", "Нет в базах"])
+        c1 = ttk.Combobox(flt, textvariable=self.view, state="readonly", width=20,
+                          values=["Все", "Только с обновлениями", "Актуальные", "Закреплённые", "Нет в базах"])
         c1.pack(side="left", padx=(4, 14))
         ttk.Label(flt, text="Источник:").pack(side="left")
         self.srcf = tk.StringVar(value="Все")
@@ -630,7 +767,6 @@ class App(tk.Tk):
         self.menu.add_command(label="Копировать название", command=self.copy_name)
         self.menu.add_command(label="Открыть папку программы", command=self.open_folder)
 
-        # --- вкладка «История»
         hb = ttk.Frame(tab2, padding=(0, 8))
         hb.pack(fill="x")
         ttk.Button(hb, text="↩ Откатить выбранное обновление", command=self.rollback_history).pack(side="left")
@@ -651,14 +787,27 @@ class App(tk.Tk):
         hs.pack(side="right", fill="y")
         self.htree.tag_configure("bad", foreground="#b00020")
 
-        # лог и статус
-        self.progress = ttk.Progressbar(self, mode="determinate")
-        self.progress.pack(fill="x", padx=10, pady=(8, 0))
-        self.log = tk.Text(self, height=7, state="disabled", bg="#1e1e1e", fg="#dcdcdc",
-                           font=("Consolas", 9), relief="flat")
-        self.log.pack(fill="x", padx=10, pady=(6, 0))
-        self.status = tk.StringVar()
-        ttk.Label(self, textvariable=self.status, anchor="w", padding=(10, 6)).pack(fill="x")
+        # журнал (размер меняется перетаскиванием разделителя)
+        lh = ttk.Frame(logf)
+        lh.pack(fill="x", pady=(4, 2))
+        ttk.Label(lh, text="Журнал", font=("Segoe UI", 9, "bold")).pack(side="left")
+        ttk.Label(lh, text="  ↕ потяните границу над журналом, чтобы изменить его высоту",
+                  foreground="#888").pack(side="left")
+        ttk.Button(lh, text="Очистить", width=10, command=self.clear_log).pack(side="right")
+        lw = ttk.Frame(logf)
+        lw.pack(fill="both", expand=True)
+        self.log = tk.Text(lw, height=6, state="disabled", bg="#1e1e1e", fg="#dcdcdc",
+                           font=("Consolas", 9), relief="flat", wrap="word")
+        ls = ttk.Scrollbar(lw, command=self.log.yview)
+        self.log.configure(yscrollcommand=ls.set)
+        self.log.pack(side="left", fill="both", expand=True)
+        ls.pack(side="right", fill="y")
+
+    def init_sash(self):
+        try:
+            self.pw.sashpos(0, int(self.pw.winfo_height() * 0.70))
+        except tk.TclError:
+            pass
 
     def build_menu(self, mb):
         m = tk.Menu(mb, tearoff=0)
@@ -671,7 +820,7 @@ class App(tk.Tk):
                              ("scoop", "Scoop", have_scoop())):
             v = tk.BooleanVar(value=self.cfg["sources"].get(k, True))
             self.src_vars[k] = v
-            sm.add_checkbutton(label=label + ("" if ok else "  (не установлен)"), variable=v,
+            sm.add_checkbutton(label=label + ("" if ok else "  (не найден)"), variable=v,
                                command=self.save_options, state="normal" if ok else "disabled")
         m.add_cascade(label="Источники обновлений", menu=sm)
         self.close_var = tk.StringVar(value=self.cfg["close_mode"])
@@ -680,14 +829,14 @@ class App(tk.Tk):
                            ("never", "Не закрывать")):
             cm.add_radiobutton(label=label, value=val, variable=self.close_var, command=self.save_options)
         m.add_cascade(label="Закрытие запущенных программ", menu=cm)
-        self.start_var = tk.BooleanVar(value=self.cfg["scan_on_start"])
-        m.add_checkbutton(label="Проверять при запуске", variable=self.start_var, command=self.save_options)
         m.add_separator()
+        m.add_command(label="Найденные инструменты (winget, Chocolatey, Scoop)…", command=self.show_tools)
         m.add_command(label="Экспорт списка в CSV…", command=self.export_csv)
-        m.add_command(label="Открыть папку с настройками", command=lambda: os.startfile(app_dir()) if hasattr(os, "startfile") else None)
+        m.add_command(label="Открыть папку с настройками",
+                      command=lambda: os.startfile(app_dir()) if hasattr(os, "startfile") else None)
         m.add_command(label="Справка", command=lambda: messagebox.showinfo("Справка", HELP_TEXT))
         m.add_command(label=f"О программе (v{VERSION})", command=lambda: messagebox.showinfo(
-            "О программе", f"{APP_NAME} {VERSION}\nПортативный аналог SUMo для Windows 11.\n"
+            "О программе", f"{APP_NAME} {VERSION}\nПроверка и установка обновлений программ для Windows 11.\n"
                            "Источники: winget, Microsoft Store, Chocolatey, Scoop."))
 
     def bind_keys(self):
@@ -696,13 +845,21 @@ class App(tk.Tk):
         self.bind("<Control-a>", lambda e: self.toggle_all_updates())
         self.tree.bind("<space>", self.space_toggle)
 
+    def show_tools(self):
+        lines = [f"winget: {find_winget() or 'не найден'}",
+                 f"Chocolatey: {find_choco() or 'не найден'}",
+                 f"Scoop: {find_scoop() or 'не найден'}"]
+        messagebox.showinfo("Найденные инструменты", "\n".join(lines) +
+                            "\n\nChocolatey и Scoop необязательны: без них программа проверяет "
+                            "winget и Microsoft Store. Если они установлены — используются автоматически.")
+
     def save_options(self):
         self.cfg["sources"] = {k: v.get() for k, v in self.src_vars.items()}
         self.cfg["close_mode"] = self.close_var.get()
-        self.cfg["scan_on_start"] = self.start_var.get()
         save_settings(self.cfg)
 
     def on_close(self):
+        self.cancel.set()
         self.cfg["geometry"] = self.geometry()
         self.cfg["cache"] = self.items
         save_settings(self.cfg)
@@ -720,10 +877,17 @@ class App(tk.Tk):
         self.log.see("end")
         self.log.configure(state="disabled")
 
+    def clear_log(self):
+        self.log.configure(state="normal")
+        self.log.delete("1.0", "end")
+        self.log.configure(state="disabled")
+
     def set_busy(self, busy, msg=None):
         self.busy = busy
+        st = "disabled" if busy else "normal"
         for b in (self.btn_scan, self.btn_upd, self.btn_all, self.btn_pin, self.btn_rb):
-            b.configure(state="disabled" if busy else "normal")
+            b.configure(state=st)
+        self.btn_stop.configure(state="normal" if self.running_jobs else "disabled")
         if msg:
             self.status.set(msg)
 
@@ -757,7 +921,7 @@ class App(tk.Tk):
                   "new": lambda i: i["available"], "src": lambda i: SOURCE_LABEL.get(i["source"], ""),
                   "status": lambda i: STATUS_ORDER[self.eff_status(i)]}[self.sort_col]
             items.sort(key=kf, reverse=self.sort_desc)
-        else:
+        else:  # по умолчанию: сначала те, что нужно обновить
             items.sort(key=lambda i: (STATUS_ORDER[self.eff_status(i)], i["name"].lower()))
         for it in items:
             k = key_of(it)
@@ -836,6 +1000,19 @@ class App(tk.Tk):
             messagebox.showinfo("Папка", "Папка установки этой программы неизвестна.")
 
     # --------------------------------------------------------------- очередь
+    def apply_result(self, h):
+        """Сразу отражает результат операции в списке (не дожидаясь повторной проверки)."""
+        if not h["ok"]:
+            return
+        it = next((i for i in self.items if i["name"] == h["name"]), None)
+        if not it:
+            return
+        self.checked.discard(key_of(it))
+        if h["action"] == "update":
+            it.update(version=h["to"] or it["version"], available="", status="ok")
+        else:  # откат: новая версия снова считается доступной
+            it.update(version=h["to"], available=h["from"], status="update")
+
     def poll(self):
         try:
             while True:
@@ -843,13 +1020,16 @@ class App(tk.Tk):
                 if kind == "log":
                     self.write_log(data)
                 elif kind == "progress":
-                    self.progress.configure(mode="determinate", maximum=data[1], value=data[0])
+                    self.progress.configure(mode="determinate", maximum=max(data[1], 1), value=data[0])
                     self.status.set(data[2])
                 elif kind == "hist":
                     self.cfg["history"].append(data)
                     self.cfg["history"] = self.cfg["history"][-300:]
+                    self.apply_result(data)
+                    self.cfg["cache"] = self.items
                     save_settings(self.cfg)
                     self.refresh_history()
+                    self.refresh_table()
                 elif kind == "scan_done":
                     self.progress.stop()
                     self.progress.configure(mode="determinate", value=0)
@@ -859,13 +1039,17 @@ class App(tk.Tk):
                         self.cfg["cache_time"] = time.strftime("%d.%m.%Y %H:%M")
                         save_settings(self.cfg)
                         self.checked &= {key_of(i) for i in data if self.updatable(i)}
+                    self.sort_col, self.sort_desc = None, False  # после проверки — обновления сверху
                     self.refresh_table()
+                    self.tree.yview_moveto(0)
                     n = int(self.cnt["update"].cget("text"))
                     self.set_busy(False, (f"Готово. Найдено обновлений: {n}. Отметьте нужные ☑ и нажмите «Обновить отмеченные»."
-                                          if n else "Готово. Все отслеживаемые программы актуальны."))
+                                          if n else "Готово. Обновлений не найдено."))
                 elif kind == "jobs_done":
+                    self.running_jobs = False
                     self.set_busy(False, data)
-                    self.start_scan()
+                    if not self.cancel.is_set():
+                        self.start_scan()
         except queue.Empty:
             pass
         self.after(100, self.poll)
@@ -874,7 +1058,7 @@ class App(tk.Tk):
     def start_scan(self):
         if self.busy:
             return
-        if not (have_winget() or have_choco() or have_scoop()) and winreg:
+        if winreg and not (have_winget() or have_choco() or have_scoop()):
             self.write_log("❌ Не найден ни winget, ни Chocolatey, ни Scoop. Установите «Установщик приложений» из Microsoft Store.")
             return
         self.set_busy(True, "Идёт проверка: читаю список программ и опрашиваю источники…")
@@ -882,10 +1066,11 @@ class App(tk.Tk):
         self.progress.configure(mode="indeterminate")
         self.progress.start(12)
         srcs = dict(self.cfg["sources"])
+        log = lambda t: self.q.put(("log", t))
 
         def work():
             try:
-                self.q.put(("scan_done", scan(srcs)))
+                self.q.put(("scan_done", scan(srcs, log)))
             except Exception as e:
                 self.q.put(("log", f"❌ Ошибка проверки: {e}"))
                 self.q.put(("scan_done", None))
@@ -919,7 +1104,7 @@ class App(tk.Tk):
         self.run_updates(items)
 
     def ask_close(self, items):
-        """Возвращает dict key -> [pid,...] для закрытия, либо None если пользователь отменил."""
+        """dict key -> [pid,...] для закрытия, либо None, если пользователь отменил."""
         mode = self.cfg["close_mode"]
         if mode == "never":
             return {}
@@ -956,17 +1141,27 @@ class App(tk.Tk):
         self.start_jobs(jobs)
 
     def start_jobs(self, jobs):
+        self.cancel = threading.Event()
+        self.running_jobs = True
         self.set_busy(True, "Установка…")
         self.progress.configure(mode="determinate", maximum=len(jobs), value=0)
-        threading.Thread(target=self.jobs_worker, args=(jobs,), daemon=True).start()
+        threading.Thread(target=self.jobs_worker, args=(jobs, self.cancel), daemon=True).start()
 
-    def jobs_worker(self, jobs):
+    def stop_jobs(self):
+        if self.running_jobs:
+            self.cancel.set()
+            self.status.set("Останавливаю…")
+
+    def jobs_worker(self, jobs, cancel):
         log = lambda t: self.q.put(("log", t))
-        ok_n = 0
+        ok_n, total = 0, len(jobs)
         for n, job in enumerate(jobs, 1):
+            if cancel.is_set():
+                log("⏹ Остановлено — оставшиеся программы пропущены")
+                break
             it, act, ver = job["item"], job["action"], job.get("version")
             title = "Откат" if act == "rollback" else "Обновление"
-            self.q.put(("progress", (n - 1, len(jobs), f"{title} {n}/{len(jobs)}: {it['name']}")))
+            self.q.put(("progress", (n - 1, total, f"{title} {n}/{total}: {it['name']}")))
             cmd = rollback_cmd(it, ver) if act == "rollback" else upgrade_cmd(it)
             ok = False
             if not cmd:
@@ -977,24 +1172,26 @@ class App(tk.Tk):
                     close_processes(job["close"], log)
                 log(f"{'↩' if act == 'rollback' else '⬆'} {it['name']} → {ver or it['available']}")
                 try:
-                    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                                         encoding="utf-8", errors="replace", creationflags=NO_WINDOW)
-                    for line in p.stdout:
-                        line = line.strip()
-                        if line and not re.fullmatch(r"[-\\|/\s█▒]+", line):
-                            log("   " + line)
-                    p.wait()
-                    ok = p.returncode == 0
-                    log("   ✔ готово" if ok else f"   ⚠ завершено с кодом {p.returncode}"
-                        + (" (попробуйте «От администратора»)" if p.returncode else ""))
+                    rc = stream_cmd(cmd, log, cancel)
                 except Exception as e:
                     log(f"   ❌ {e}")
+                    rc = -1
+                if cancel.is_set():
+                    log("⏹ Остановлено пользователем")
+                    break
+                if rc == 0:
+                    ok = True
+                    log("   ✔ готово")
+                elif rc is not None:
+                    hint = WINGET_HINTS.get(rc, "попробуйте повторить или запустите программу от администратора")
+                    log(f"   ⚠ код {rc:#x}: {hint}")
             ok_n += ok
             self.q.put(("hist", {"time": time.strftime("%d.%m.%Y %H:%M"), "name": it["name"],
                                  "id": it["id"], "source": it["source"], "action": act,
                                  "from": it["version"], "to": ver or it["available"], "ok": ok}))
-        self.q.put(("progress", (len(jobs), len(jobs), "Завершено")))
-        self.q.put(("jobs_done", f"Выполнено успешно: {ok_n} из {len(jobs)}. Повторная проверка…"))
+        self.q.put(("progress", (total, total, "Завершено")))
+        self.q.put(("jobs_done", f"Выполнено успешно: {ok_n} из {total}."
+                    + ("" if cancel.is_set() else " Повторная проверка…")))
 
     # ----------------------------------------------------------------- закрепление
     def toggle_pin(self):
@@ -1096,6 +1293,11 @@ def main():
         ctypes.windll.shcore.SetProcessDpiAwareness(1)
     except Exception:
         pass
+    # Запуск от имени администратора. Готовый exe уже собран с манифестом UAC;
+    # этот блок нужен при запуске из исходников (python update_checker.py).
+    if winreg is not None and not is_admin() and "--no-elevate" not in sys.argv:
+        if relaunch_as_admin():
+            return
     App().mainloop()
 
 
