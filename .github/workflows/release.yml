@@ -12,6 +12,8 @@ permissions:
 jobs:
   build:
     runs-on: windows-latest
+    env:
+      PYTHONUTF8: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -20,8 +22,19 @@ jobs:
       - name: Tests
         run: python tests/test_logic.py
       - name: Smoke test on real Windows (read-only)
+        id: smoke
         continue-on-error: true
-        run: python tests/test_windows_smoke.py
+        shell: pwsh
+        run: python tests/test_windows_smoke.py 2>&1 | Tee-Object -FilePath smoke.txt; exit $LASTEXITCODE
+      - name: Smoke report
+        if: always()
+        shell: pwsh
+        run: |
+          $t = Get-Content smoke.txt -Raw -ErrorAction SilentlyContinue
+          if (-not $t) { $t = 'no output' }
+          $t = "outcome=${{ steps.smoke.outcome }}`n" + $t
+          $t = $t.Substring(0, [Math]::Min($t.Length, 3500)) -replace '%','%25' -replace "`r",'' -replace "`n",'%0A'
+          Write-Output "::notice title=smoke::$t"
       - name: Build portable exe
         run: |
           pip install pyinstaller
