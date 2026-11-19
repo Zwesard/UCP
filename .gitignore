@@ -4,3 +4,4 @@ dist/
 *.spec
 settings.json
 *.csv
+driver_backups/

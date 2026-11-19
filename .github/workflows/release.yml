@@ -19,6 +19,9 @@ jobs:
           python-version: "3.12"
       - name: Tests
         run: python tests/test_logic.py
+      - name: Smoke test on real Windows (read-only)
+        continue-on-error: true
+        run: python tests/test_windows_smoke.py
       - name: Build portable exe
         run: |
           pip install pyinstaller
