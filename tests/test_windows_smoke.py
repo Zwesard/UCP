@@ -19,4 +19,21 @@ print(f"Центр обновления: {'недоступен' if ups is None 
 if ups: print("пример обновления:", ups[0])
 items, wu_ok = m.scan_drivers(print, wu_timeout=150)
 print("scan_drivers:", len(items), "wu_ok:", wu_ok)
+
+# --- winget / Chocolatey на настоящем выводе (то, из-за чего раньше «ничего не находило»)
+if m.find_winget():
+    m.ERRS.clear(); t = time.time()
+    wl = m.winget_installed(); wu = m.winget_outdated()
+    print(f"winget list: {len(wl)} шт., upgrade: {len(wu)} шт. ({time.time() - t:.1f} c); ошибки: {m.ERRS}")
+    print("пример list:", wl[:2]); print("пример upgrade:", wu[:2])
+    print("--- сырой вывод winget list (начало):"); print("\n".join((m.RAW.get("winget list") or "").splitlines()[:8]))
+    print("--- сырой вывод winget upgrade (начало):"); print("\n".join((m.RAW.get("winget upgrade") or "").splitlines()[:8]))
+if m.find_choco():
+    ci, co = m.choco_installed(), m.choco_outdated()
+    print(f"choco: установлено {len(ci)}, обновлений {len(co)}; пример: {ci[:2]}")
+logs = []
+items = m.scan({"winget": True, "msstore": True, "choco": True, "scoop": True}, logs.append)
+print("полная проверка программ:", len(items), "из них с обновлением:", sum(1 for i in items if i["status"] == "update"),
+      "| известны менеджеру:", sum(1 for i in items if i["id"]))
+print("\n".join(logs))
 print("SMOKE OK")
